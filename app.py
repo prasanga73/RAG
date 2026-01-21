@@ -1,7 +1,6 @@
 import streamlit as st
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
 from sentence_transformers import CrossEncoder
 import os
 
@@ -72,18 +71,22 @@ def clean_clause_text(text: str) -> str:
     """Strip whitespace from clause text."""
     return text.strip()
 
-def retrieve_context(query: str, k: int = 4, keyword_boost: bool = True, rerank: bool = True):
+def retrieve_context(query: str, k: int = 5, keyword_boost: bool = True, rerank: bool = True, relevance_threshold: float = 0.5):
     """
-    Retrieve top-k relevant clauses for a query from the vectorstore.
+    Retrieve top-k relevant clauses for a query from the vectorstore, with optional
+    keyword boosting and reranking. Returns fallback message if no clauses meet
+    the relevance threshold.
     
     Parameters:
         query (str): The user query.
         k (int): Number of clauses to return.
         keyword_boost (bool): Whether to boost docs containing query keywords.
         rerank (bool): Whether to rerank results using the reranker.
+        relevance_threshold (float): Minimum relevance score (0-1) to include results.
+                                     Lower = more lenient, higher = stricter.
         
     Returns:
-        tuple: (list_of_documents)
+        list: Top-k relevant clauses, or empty list if no relevant clauses found.
     """
     vectorstore = st.session_state.vectorstore
     reranker = st.session_state.reranker
@@ -102,14 +105,24 @@ def retrieve_context(query: str, k: int = 4, keyword_boost: bool = True, rerank:
         score = 1.0 + keyword_score if keyword_boost else 1.0
         scored_docs.append((score, d))
 
+    # Sort descending by score
     scored_docs.sort(key=lambda x: x[0], reverse=True)
     docs_sorted = [d for _, d in scored_docs]
 
-    # Step 3: Optional reranking
+    # Step 3: Optional reranking with relevance threshold
     if rerank:
+        # Prepare query-doc pairs for reranker
         pairs = [[query, d.page_content] for d in docs_sorted]
-        scores = reranker.predict(pairs)
-        reranked = sorted(zip(docs_sorted, scores), key=lambda x: x[1], reverse=True)
+        scores = reranker.predict(pairs)  # Returns scores typically 0-1
+
+        # Filter by relevance threshold BEFORE sorting
+        filtered_pairs = [(d, score) for d, score in zip(docs_sorted, scores) if score >= relevance_threshold]
+        
+        if not filtered_pairs:
+            return []
+        
+        # Sort by reranker scores
+        reranked = sorted(filtered_pairs, key=lambda x: x[1], reverse=True)
         docs_sorted = [d for d, _ in reranked]
 
     # Step 4: Keep only top-k clauses
@@ -155,9 +168,11 @@ def main():
         )
         
         st.header("⚙️ Settings")
-        num_results = st.slider("Number of clauses to retrieve:", 2, 8, 4)
+        num_results = st.slider("Number of clauses to retrieve:", 2, 8, 5)
         keyword_boost = st.checkbox("Enable keyword boosting", value=True)
         rerank = st.checkbox("Enable reranking", value=True)
+        relevance_threshold = st.slider("Relevance threshold (0.0 - 1.0):", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+        st.caption("⚠️ Higher threshold = stricter filtering, fewer results")
         
         if st.button("🔄 Clear Chat History"):
             st.session_state.messages = []
@@ -207,7 +222,8 @@ def main():
                         query,
                         k=num_results,
                         keyword_boost=keyword_boost,
-                        rerank=rerank
+                        rerank=rerank,
+                        relevance_threshold=relevance_threshold
                     )
                     
                     response = format_response(query, docs)
