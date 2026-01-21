@@ -1,9 +1,10 @@
-
 import streamlit as st
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
-
-from sentence_transformers import CrossEncoder
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import re
+from numpy import dot
+from numpy.linalg import norm
 import os
 
 # Page configuration
@@ -49,89 +50,181 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "vectorstore" not in st.session_state:
     st.session_state.vectorstore = None
-if "reranker" not in st.session_state:
-    st.session_state.reranker = None
-if "embedding_model" not in st.session_state:
-    st.session_state.embedding_model = None
+if "query_encoder" not in st.session_state:
+    st.session_state.query_encoder = None
+if "doc_encoder" not in st.session_state:
+    st.session_state.doc_encoder = None
+if "cross_encoder" not in st.session_state:
+    st.session_state.cross_encoder = None
 
-@st.cache_resource
-def load_vectorstore():
-    """Load the persisted Chroma vector store."""
-    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = Chroma(
-        persist_directory="./chroma_nepal_law_store",
-        embedding_function=embedding_model
-    )
-    return vectorstore, embedding_model
-
-@st.cache_resource
-def load_reranker():
-    """Load the CrossEncoder reranker."""
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
+# =========================
+# 1️⃣ Clean clause text
+# =========================
 def clean_clause_text(text: str) -> str:
     """Strip whitespace from clause text."""
     return text.strip()
 
-def retrieve_context(query: str, k: int = 5, keyword_boost: bool = True, rerank: bool = True, relevance_threshold: float = 0.5):
+
+# =========================
+# 2️⃣ Keyword extraction
+# =========================
+LEGAL_STOPWORDS = {
+    "the", "of", "and", "for", "in", "on", "to", "with", "under", "by", "a", "an"
+}
+
+def extract_keywords(text: str):
     """
-    Retrieve top-k relevant clauses for a query from the vectorstore, with optional
-    keyword boosting and reranking. Returns fallback message if no clauses meet
-    the relevance threshold.
-    
-    Parameters:
-        query (str): The user query.
-        k (int): Number of clauses to return.
-        keyword_boost (bool): Whether to boost docs containing query keywords.
-        rerank (bool): Whether to rerank results using the reranker.
-        relevance_threshold (float): Minimum relevance score (0-1) to include results.
-                                     Lower = more lenient, higher = stricter.
-        
-    Returns:
-        list: Top-k relevant clauses, or empty list if no relevant clauses found.
+    Simple keyword extraction for legal queries:
+    - Lowercases text
+    - Splits by non-word characters
+    - Removes stopwords and very short words
+    """
+    words = re.findall(r"\b\w+\b", text.lower())
+    keywords = [w for w in words if len(w) > 2 and w not in LEGAL_STOPWORDS]
+    return set(keywords)
+
+
+# =========================
+# 3️⃣ Hybrid retrieval (vector + keyword)
+# =========================
+def hybrid_search(query: str, vector_k: int = 10, keyword_k: int = 5):
+    """
+    Retrieve candidate clauses from vector similarity and keyword matching.
+    Returns combined list (vector first, then keyword-only hits).
     """
     vectorstore = st.session_state.vectorstore
-    reranker = st.session_state.reranker
     
-    # Step 1: Initial vector search
-    docs = vectorstore.similarity_search(query, k=10)
-    if not docs:
-        return []
+    # Vector search
+    vector_docs = vectorstore.similarity_search(query, k=vector_k)
 
-    # Step 2: Optional keyword boosting
-    query_words = set(query.lower().split())
+    # Keyword-only search (for fallback)
+    keywords = extract_keywords(query)
+    if keywords:
+        keyword_docs = vectorstore.similarity_search(" ".join(keywords), k=keyword_k)
+    else:
+        keyword_docs = []
+
+    # Combine while keeping original order (vector first)
+    combined_docs = vector_docs + [d for d in keyword_docs if d not in vector_docs]
+
+    return combined_docs
+
+
+# =========================
+# 4️⃣ Keyword boosting
+# =========================
+def keyword_boosting(docs, query: str, boost: bool = True):
+    """Boost scores for docs containing important keywords."""
+    query_keywords = extract_keywords(query)
     scored_docs = []
     for d in docs:
         text = d.page_content.lower()
-        keyword_score = sum(1 for w in query_words if w in text)
-        score = 1.0 + keyword_score if keyword_boost else 1.0
+        keyword_score = sum(1 for w in query_keywords if w in text)
+        score = 1.0 + keyword_score if boost else 1.0
         scored_docs.append((score, d))
-
-    # Sort descending by score
     scored_docs.sort(key=lambda x: x[0], reverse=True)
-    docs_sorted = [d for _, d in scored_docs]
+    return [d for _, d in scored_docs]
 
-    # Step 3: Optional reranking with relevance threshold
+
+# =========================
+# 5️⃣ Reranking with dual-encoder + cross-encoder
+# =========================
+def rerank_docs(docs, query: str, alpha: float = 0.5, show_scores: bool = False):
+    """
+    Rerank candidate clauses using:
+    - Bi-encoder similarity (query + doc)
+    - Cross-encoder relevance
+    Combines scores with weight alpha.
+    Filters docs below threshold.
+    """
+    if not docs:
+        return []
+
+    query_encoder = st.session_state.query_encoder
+    doc_encoder = st.session_state.doc_encoder
+    cross_encoder = st.session_state.cross_encoder
+
+    # Bi-encoder similarity
+    query_vec = query_encoder.encode(query)
+    doc_vecs = [doc_encoder.encode(d.page_content) for d in docs]
+    bi_scores = [dot(query_vec, d_vec)/(norm(query_vec)*norm(d_vec)) for d_vec in doc_vecs]
+
+    # Cross-encoder scores
+    pairs = [[query, d.page_content] for d in docs]
+    cross_scores = cross_encoder.predict(pairs)
+
+    # Combined score
+    combined_scores = [alpha*b + (1-alpha)*c for b, c in zip(bi_scores, cross_scores)]
+
+    if show_scores:
+        st.write("### 📊 Reranker Scores")
+        for i, (doc, score) in enumerate(zip(docs, combined_scores), 1):
+            clause_id = doc.metadata.get("clause_id", "N/A")
+            st.caption(f"**{i}. Clause ID:** {clause_id} | **Score:** {score:.4f}")
+
+    # Filter by threshold
+    filtered_docs = [d for d, s in zip(docs, combined_scores)]
+
+    # Sort descending
+    filtered_docs_sorted = sorted(filtered_docs, key=lambda d: combined_scores[docs.index(d)], reverse=True)
+
+    return filtered_docs_sorted
+
+
+# =========================
+# 6️⃣ Build final context
+# =========================
+def build_context(docs, top_k: int = 5):
+    """Concatenate top-k clauses into clean legal context."""
+    docs = docs[:top_k]
+    context_blocks = []
+    for d in docs:
+        text = clean_clause_text(d.page_content)
+        legal_source = d.metadata.get("legal_document_source", "")
+        meta_block = f"\nLegal Document Source: {legal_source}" if legal_source else ""
+        context_blocks.append(f"Clause Text:\n{text}{meta_block}")
+    return "\n\n" + ("\n" + "-" * 80 + "\n").join(context_blocks)
+
+
+# =========================
+# 7️⃣ Full improved pipeline
+# =========================
+def retrieve_context_pipeline(
+    query: str,
+    top_k: int = 5,
+    vector_k: int = 10,
+    keyword_k: int = 5,
+    keyword_boost: bool = True,
+    rerank: bool = True,
+    reranker_threshold: float = 0.0,
+    alpha: float = 0.5,
+    show_scores: bool = False
+):
+    """
+    Full retrieval pipeline combining hybrid search, keyword boosting, and reranking.
+    """
+    # Step 1: Hybrid retrieval
+    docs = hybrid_search(query, vector_k=vector_k, keyword_k=keyword_k)
+    if not docs:
+        return [], "NO_RELEVANT_CONTEXT"
+
+    # Step 2: Keyword boosting
+    docs = keyword_boosting(docs, query, boost=keyword_boost)
+
+    # Step 3: Rerank (optional)
     if rerank:
-        # Prepare query-doc pairs for reranker
-        pairs = [[query, d.page_content] for d in docs_sorted]
-        scores = reranker.predict(pairs)  # Returns scores typically 0-1
+        docs = rerank_docs(docs, query, alpha=alpha, show_scores=show_scores)
+        if not docs:
+            return [], "NO_RELEVANT_CONTEXT"
 
-        # Filter by relevance threshold BEFORE sorting
-        filtered_pairs = [(d, score) for d, score in zip(docs_sorted, scores) if score >= relevance_threshold]
-        
-        if not filtered_pairs:
-            return []
-        
-        # Sort by reranker scores
-        reranked = sorted(filtered_pairs, key=lambda x: x[1], reverse=True)
-        docs_sorted = [d for d, _ in reranked]
+    # Step 4: Build final context
+    context = build_context(docs, top_k=top_k)
+    return docs, context
 
-    # Step 4: Keep only top-k clauses
-    docs_sorted = docs_sorted[:k]
 
-    return docs_sorted
-
+# =========================
+# 8️⃣ Format response
+# =========================
 def format_response(query: str, docs) -> str:
     """Format the response with context and sources."""
     if not docs:
@@ -147,6 +240,29 @@ def format_response(query: str, docs) -> str:
     response += "**Disclaimer:** This information is based on the legal documents in our knowledge base. For legal advice, please consult a qualified lawyer."
     
     return response
+
+
+# =========================
+# Load Models
+# =========================
+@st.cache_resource
+def load_vectorstore():
+    """Load the persisted Chroma vector store."""
+    embedding_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vectorstore = Chroma(
+        persist_directory="./chroma_nepal_law_store",
+        embedding_function=embedding_model
+    )
+    return vectorstore
+
+@st.cache_resource
+def load_encoders():
+    """Load the dual-encoder and cross-encoder models."""
+    query_encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    doc_encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return query_encoder, doc_encoder, cross_encoder
+
 
 def main():
     # Header
@@ -169,12 +285,8 @@ def main():
             """
         )
         
-        st.header("⚙️ Settings")
-        num_results = st.slider("Number of clauses to retrieve:", 2, 8, 5)
-        keyword_boost = st.checkbox("Enable keyword boosting", value=True)
-        rerank = st.checkbox("Enable reranking", value=True)
-        relevance_threshold = st.slider("Relevance threshold (0.0 - 1.0):", min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-        st.caption("⚠️ Higher threshold = stricter filtering, fewer results")
+        st.header("⚙️ Retrieval Settings")
+        top_k = st.slider("Top-k clauses to return:", 2, 10, 5)
         
         if st.button("🔄 Clear Chat History"):
             st.session_state.messages = []
@@ -182,18 +294,19 @@ def main():
 
     # Load models
     try:
-        with st.spinner("Loading legal knowledge base..."):
+        with st.spinner("Loading legal knowledge base and AI models..."):
             if st.session_state.vectorstore is None:
-                vectorstore, embedding_model = load_vectorstore()
-                st.session_state.vectorstore = vectorstore
-                st.session_state.embedding_model = embedding_model
+                st.session_state.vectorstore = load_vectorstore()
             
-            if st.session_state.reranker is None:
-                st.session_state.reranker = load_reranker()
+            if st.session_state.query_encoder is None:
+                query_enc, doc_enc, cross_enc = load_encoders()
+                st.session_state.query_encoder = query_enc
+                st.session_state.doc_encoder = doc_enc
+                st.session_state.cross_encoder = cross_enc
         
-        st.success("✅ Knowledge base loaded successfully!")
+        st.success("✅ Knowledge base and models loaded successfully!")
     except Exception as e:
-        st.error(f"❌ Error loading knowledge base: {e}")
+        st.error(f"❌ Error loading models: {e}")
         st.info("Please ensure the Chroma vector store exists at `./chroma_nepal_law_store/`")
         return
 
@@ -220,15 +333,14 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Searching legal documents..."):
                 try:
-                    docs = retrieve_context(
+                    docs, context = retrieve_context_pipeline(
                         query,
-                        k=num_results,
-                        keyword_boost=keyword_boost,
-                        rerank=rerank,
-                        relevance_threshold=relevance_threshold
+                        top_k=top_k,
+                        vector_k=top_k * 2,
+                        keyword_k=top_k
                     )
                     
-                    response = format_response(query, docs)
+                    response = format_response(query, docs[:top_k])
                     st.markdown(response, unsafe_allow_html=True)
                     
                     # Store in session
@@ -239,6 +351,8 @@ def main():
                 
                 except Exception as e:
                     st.error(f"❌ Error processing query: {e}")
+                    st.write(f"Debug info: {str(e)}")
+
 
 if __name__ == "__main__":
     main()
