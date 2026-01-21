@@ -1,7 +1,8 @@
 
 import streamlit as st
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
+
 from sentence_transformers import CrossEncoder
 import os
 
